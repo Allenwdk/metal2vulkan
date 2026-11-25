@@ -517,7 +517,7 @@ impl Device {
             handle,
             memory_type: index,
         };
-        match unsafe { memory::import(core, &info, handle.vk(), None, own) } {
+        match unsafe { memory::import(core, &info, handle.vk(), None, false, own) } {
             Ok(memory) => Ok((claim(core, memory, release), index)),
             Err(ImportFailed::Before(error)) => {
                 // Nothing was imported, so the fd is still ours: closed, where it is still the
@@ -804,6 +804,40 @@ impl Device {
         len: u64,
         release: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<(Block, u32), Error> {
+        // SAFETY: the caller guarantees `pointer` is mapped readable and writable until `release` runs.
+        unsafe { self.import_host_memory_inner(pointer, len, false, release) }
+    }
+
+    /// Like [`Device::import_host_memory`], for host pages that are mapped readable only.
+    ///
+    /// The returned block carries no runtime host mapping (`Buffer::contents` returns `None`),
+    /// and runtime write paths (zeroing, Managed placement, `did_modify_range`, blit writes,
+    /// writable textures over the buffer, visibility result writes, and encoder `WRITE` usage)
+    /// refuse the block with [`Refusal::ReadOnlyBuffer`](crate::Refusal::ReadOnlyBuffer).
+    ///
+    /// # Safety
+    ///
+    /// The `len` bytes at `pointer` are host memory mapped readable (they need not be writable),
+    /// and stay mapped, and not mapped anew, until `release` runs; where the call returns `Err`,
+    /// they are the consumer's again at once. Shaders bound to buffers placed in this block
+    /// must only read from it.
+    pub unsafe fn import_read_only_host_memory(
+        &self,
+        pointer: NonNull<u8>,
+        len: u64,
+        release: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(Block, u32), Error> {
+        // SAFETY: the caller guarantees `pointer` is mapped readable until `release` runs.
+        unsafe { self.import_host_memory_inner(pointer, len, true, release) }
+    }
+
+    unsafe fn import_host_memory_inner(
+        &self,
+        pointer: NonNull<u8>,
+        len: u64,
+        read_only: bool,
+        release: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(Block, u32), Error> {
         let core = self.core();
         let handle = ImportHandle::HostMemory;
         if core.closed() {
@@ -856,12 +890,14 @@ impl Device {
             .push_next(&mut flags);
         // SAFETY: an import of the caller's memory, at the device's alignment, into a type its
         // query offered and its buffers can use.
+        let mapping = (!read_only).then(|| Mapping::new(pointer));
         let memory = unsafe {
             memory::import(
                 core,
                 &info,
                 handle.vk(),
-                Some(Mapping::new(pointer)),
+                mapping,
+                read_only,
                 Own::Import {
                     handle,
                     memory_type: index,
@@ -925,7 +961,7 @@ pub(crate) fn surface_import(
     let own = Own::Surface { import: true };
     // SAFETY: an import of the dma-buf into a type its query offered, its buffers list and its
     // planes' imports took, of at least the buffer's size.
-    match unsafe { memory::import(core, &info, handle.vk(), None, own) } {
+    match unsafe { memory::import(core, &info, handle.vk(), None, false, own) } {
         Ok(memory) => Ok(memory::Block::new(memory, Arc::clone(core))),
         Err(ImportFailed::Before(error)) => {
             // Nothing was imported, so the duplicate is still ours: closed, where it is still

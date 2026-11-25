@@ -829,11 +829,15 @@ impl ComputeCommandEncoder {
         resource: Resource<'_>,
         usage: ResourceUsage,
     ) -> Result<(), Error> {
+        let writes = usage.access().is_some_and(Access::writes);
         let building = self.building();
         let (id, shared, unstored, texture, span, place) = match resource {
             Resource::Buffer(buffer) => {
                 if !buffer.is_of(building.device.core()) {
                     return Err(Error::Refused(Refusal::OtherDevice));
+                }
+                if writes && buffer.is_read_only() {
+                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
                 }
                 building.keep(buffer);
                 (
@@ -848,6 +852,9 @@ impl ComputeCommandEncoder {
             Resource::Texture(texture) => {
                 if !texture.is_of(building.device.core()) {
                     return Err(Error::Refused(Refusal::OtherDevice));
+                }
+                if writes && texture.is_over_read_only_buffer() {
+                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
                 }
                 // SAFETY: the encoder's declarations hold the borrow, and they end before its
                 // command buffer commits.

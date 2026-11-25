@@ -248,6 +248,9 @@ impl Device {
             }));
         }
         let block = self.placed(block, offset, length)?;
+        if block.memory.read_only && zero_from.is_some_and(|from| from < length) {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         // A block the host does not map (Private, or an imported dma-buf) is zeroed by a GPU fill.
         if block.memory.mapping.is_none() && zero_from.is_some_and(|from| from < length) {
             crate::command::not_in_scheduled_handler()?;
@@ -342,6 +345,9 @@ impl Device {
         }
         let (block, offset) = bytes;
         let block = self.placed(block, offset, length)?;
+        if block.memory.read_only {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         if block.memory.class == MemoryClass::Private {
             return Err(Error::Refused(Refusal::ManagedBlockPrivate {
                 block: block.memory.id,
@@ -431,6 +437,9 @@ impl Device {
                 length,
                 block_len,
             }))?;
+        if block.memory.read_only && length > 0 {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         if block.memory.class != MemoryClass::Private {
             return Err(Error::Refused(Refusal::ZeroRangeShared {
                 block: block.memory.id,
@@ -568,6 +577,11 @@ impl Buffer {
         BufferObject::contents(self)
     }
 
+    /// Whether the buffer lies in a read-only imported host-memory block.
+    pub fn is_read_only(&self) -> bool {
+        BufferObject::is_read_only(self)
+    }
+
     /// No Metal counterpart: the block the buffer is in.
     pub fn block(&self) -> BlockId {
         self.inner.block.memory.id
@@ -618,6 +632,9 @@ pub(crate) trait BufferObject {
     /// [`Buffer::did_modify_range`].
     fn did_modify_range(&self, start: u64, length: u64) -> Result<(), Error> {
         let inner = self.object();
+        if inner.block.memory.read_only {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         let end = (start.checked_add(length))
             .filter(|&end| end <= inner.length)
             .ok_or(Error::Refused(Refusal::ModifiedRange {
@@ -639,6 +656,11 @@ pub(crate) trait BufferObject {
     /// [`Buffer::contents`].
     fn contents(&self) -> Option<NonNull<u8>> {
         self.object().contents.map(Mapping::get)
+    }
+
+    /// Whether the buffer lies in a read-only imported host-memory block.
+    fn is_read_only(&self) -> bool {
+        self.object().block.memory.read_only
     }
 
     /// Whether shaders reach the buffer in Shared memory, which the host reads.

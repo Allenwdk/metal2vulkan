@@ -348,6 +348,7 @@ pub(crate) struct Memory {
     /// The device address of the block's first byte.
     pub(crate) address: u64,
     pub(crate) mapping: Option<Mapping>,
+    pub(crate) read_only: bool,
     /// Its memory type is device-local.
     device_local: bool,
     /// A Private block in another memory type than the Private one, which was out of memory.
@@ -906,6 +907,7 @@ impl Carve {
             buffer: self.buffer,
             address: self.address,
             mapping: self.mapping,
+            read_only: false,
             device_local: self.device_local,
             spilled: self.spilled,
             own: None,
@@ -2170,6 +2172,7 @@ pub(crate) unsafe fn import(
     info: &vk::MemoryAllocateInfo<'_>,
     handle: vk::ExternalMemoryHandleTypeFlags,
     mapping: Option<Mapping>,
+    read_only: bool,
     own: Own,
 ) -> Result<Memory, ImportFailed> {
     let device = &core.device;
@@ -2240,6 +2243,7 @@ pub(crate) unsafe fn import(
         buffer,
         address,
         mapping,
+        read_only,
         device_local: core.device_local & (1 << info.memory_type_index) != 0,
         spilled: false,
         own: Some(own),
@@ -2367,6 +2371,7 @@ pub(crate) fn sparse_block(
             buffer,
             address,
             mapping: None,
+            read_only: false,
             device_local,
             spilled: false,
             own: Some(own),
@@ -2497,6 +2502,7 @@ pub(crate) unsafe fn export(
         buffer,
         address,
         mapping: None,
+        read_only: false,
         device_local: core.device_local & (1 << index) != 0,
         spilled: false,
         own: Some(Own::Export {
@@ -2564,6 +2570,7 @@ pub(crate) unsafe fn export_surface(
         buffer: vk::Buffer::null(),
         address: 0,
         mapping: None,
+        read_only: false,
         device_local: core.device_local & (1 << index) != 0,
         spilled: false,
         own: Some(Own::Export { handle, bytes: len }),
@@ -2655,6 +2662,7 @@ pub(crate) unsafe fn surface_view(
         buffer,
         address,
         mapping: None,
+        read_only: false,
         device_local: under.memory.device_local,
         spilled: false,
         own: Some(Own::Surface { import: false }),

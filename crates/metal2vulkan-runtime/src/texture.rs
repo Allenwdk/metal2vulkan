@@ -4156,6 +4156,10 @@ impl Texture {
         self.view(pixel_format, texture_type, levels, slices, None, index)
     }
 
+    pub(crate) fn is_over_read_only_buffer(&self) -> bool {
+        self.inner.over().is_some_and(|b| b.is_read_only())
+    }
+
     /// `newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`: the view
     /// [`Texture::new_texture_view`] makes, its texels sampled and read through `swizzle`
     /// combined with this texture's own, as Metal combines them: each channel the view takes from
@@ -4571,6 +4575,9 @@ impl Texture {
         bytes_per_image: u64,
     ) -> Result<(), Error> {
         crate::command::not_in_scheduled_handler()?;
+        if self.is_over_read_only_buffer() {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         let inner = &self.inner;
         let len = bytes.len() as u64;
         let Some(copy) = inner.copy(region, level, slice, len, bytes_per_row, bytes_per_image)?
@@ -5840,6 +5847,13 @@ impl Buffer {
         offset: u64,
         bytes_per_row: u64,
     ) -> Result<Texture, Error> {
+        if self.is_read_only()
+            && descriptor
+                .usage
+                .intersects(TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET)
+        {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         let mut d = *descriptor;
         d.storage_mode = match self.held() {
             (_, Some(_)) => StorageMode::Managed,

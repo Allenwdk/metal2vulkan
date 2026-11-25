@@ -9,6 +9,7 @@ impl Refusal {
     pub fn basis(self) -> RefusalBasis {
         match self {
             Refusal::EmptyBuffer => RefusalBasis::MetalMeasured,
+            Refusal::ReadOnlyBuffer => RefusalBasis::Ours,
             Refusal::BufferTooLong { .. } => RefusalBasis::Ours,
             Refusal::BufferPastBlock { .. } => RefusalBasis::MetalMeasured,
             Refusal::HeapBufferPlace { .. } => RefusalBasis::MetalMeasured,

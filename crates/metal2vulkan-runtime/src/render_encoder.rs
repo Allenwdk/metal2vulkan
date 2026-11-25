@@ -827,6 +827,15 @@ fn begin(
     descriptor: &RenderPassDescriptor,
 ) -> Result<(Pass, vk::CommandBuffer, Option<Visibility>), Error> {
     let pass = Pass::check(core, descriptor)?;
+    if descriptor
+        .visibility_result_buffer
+        .as_ref()
+        .is_some_and(|b| b.is_read_only())
+        || pass.targets().any(|t| t.texture.is_over_read_only_buffer())
+        || (pass.resolving && pass.resolves().any(|r| r.texture.is_over_read_only_buffer()))
+    {
+        return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+    }
     // The attachments, and where the pass resolves the resolve textures, which the pass writes:
     // a pass that resolves nothing walks no resolve.
     let resolves = || {
@@ -1962,11 +1971,15 @@ impl RenderCommandEncoder {
         resource: Resource<'_>,
         usage: ResourceUsage,
     ) -> Result<(), Error> {
+        let writes = usage.access().is_some_and(Access::writes);
         let building = self.building();
         let (id, host, unstored, texture, span, place) = match resource {
             Resource::Buffer(buffer) => {
                 if !buffer.is_of(building.device.core()) {
                     return Err(Error::Refused(Refusal::OtherDevice));
+                }
+                if writes && buffer.is_read_only() {
+                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
                 }
                 building.keep(buffer);
                 let id = [buffer.id(), buffer.tracked_id()];
@@ -1983,6 +1996,9 @@ impl RenderCommandEncoder {
             Resource::Texture(texture) => {
                 if !texture.is_of(building.device.core()) {
                     return Err(Error::Refused(Refusal::OtherDevice));
+                }
+                if writes && texture.is_over_read_only_buffer() {
+                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
                 }
                 // SAFETY: the encoder's declarations hold the borrow, and they end before its
                 // command buffer commits.

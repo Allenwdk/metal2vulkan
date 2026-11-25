@@ -102,6 +102,11 @@ pub enum Refusal {
     ///
     /// Basis: metal-measured (an Apple M3 Max: newBufferWithLength:0 answers nil).
     EmptyBuffer,
+    /// A write, zero, or writable view requested on a block or buffer imported via
+    /// [`Device::import_read_only_host_memory`](crate::Device::import_read_only_host_memory).
+    ///
+    /// Basis: ours (read-only host pages cannot be written through runtime write paths).
+    ReadOnlyBuffer,
     /// A buffer longer than [`MAX_BUFFER_LENGTH`](crate::MAX_BUFFER_LENGTH)
     /// ([`Device::new_buffer`](crate::Device::new_buffer)), or a visible-function table whose
     /// words are
@@ -2428,6 +2433,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Refusal::EmptyBuffer => f.write_str("Metal makes no buffer of length 0"),
+            Refusal::ReadOnlyBuffer => f.write_str("cannot write to a read-only host-memory buffer"),
             Refusal::BufferTooLong { length, max } => {
                 write!(f, "a buffer of {length} bytes is longer than {max}")
             }

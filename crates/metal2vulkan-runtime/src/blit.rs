@@ -202,6 +202,9 @@ impl BlitCommandEncoder {
         if !source.is_of(core) || !destination.is_of(core) {
             return Err(Error::Refused(Refusal::OtherDevice));
         }
+        if destination.is_over_read_only_buffer() {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         // A texture buffer's texels are its buffer's bytes, which no image copy reaches.
         if source.texels() || destination.texels() {
             return Err(Error::Unsupported(Gap::TextureCopy {
@@ -438,6 +441,9 @@ impl BlitCommandEncoder {
         if !source.is_of(core) || !destination.is_of(core) {
             return Err(Error::Refused(Refusal::OtherDevice));
         }
+        if destination.is_read_only() {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         // A Managed buffer's GPU side is its device copy, where it has one.
         let span = |buffer: &Buffer| {
             let (buffer_of, base) = buffer.device_range();
@@ -520,6 +526,11 @@ impl BlitCommandEncoder {
         };
         if !texture.is_of(&self.core) || !buffer.is_of(&self.core) {
             return Err(Error::Refused(Refusal::OtherDevice));
+        }
+        if (!into_image && buffer.is_read_only())
+            || (into_image && texture.is_over_read_only_buffer())
+        {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
         }
         // A texture buffer's texels are its buffer's bytes, which no image copy reaches.
         if texture.texels() {
@@ -704,6 +715,9 @@ impl BlitCommandEncoder {
         if !buffer.is_of(core) {
             return Err(Error::Refused(Refusal::OtherDevice));
         }
+        if buffer.is_read_only() {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
+        }
         let (vk_buffer, base) = buffer.device_range();
         let (offset, length) = fill_range(base, buffer.length(), range)?;
         building.keep(buffer);
@@ -844,6 +858,9 @@ impl BlitCommandEncoder {
         let (core, building) = self.parts();
         if !texture.is_of(core) {
             return Err(Error::Refused(Refusal::OtherDevice));
+        }
+        if texture.is_over_read_only_buffer() {
+            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
         }
         let d = *texture.descriptor();
         let pixel_format = d.pixel_format;
