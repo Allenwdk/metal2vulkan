@@ -267,6 +267,7 @@ impl Pushed {
 /// What the GPU uses: the recorder, the segments, and the blocks kept until retirement.
 pub(crate) struct Gpu {
     pub(crate) recorder: Option<Recorder>,
+    pub(crate) native_presentation: bool,
     pub(crate) segments: Vec<Segment>,
     /// Each heap's block the commands use (`useHeap:`), once: a block released meanwhile is
     /// reused only after the command buffer retires.
@@ -313,6 +314,10 @@ impl Gpu {
     /// `vkQueueSubmit2`.
     pub(crate) fn presents(&self) -> bool {
         (self.segments.last()).is_some_and(|segment| !segment.binary.is_empty())
+    }
+
+    pub(crate) fn schedules_after_submit(&self) -> bool {
+        self.native_presentation || self.presents()
     }
 }
 
@@ -408,6 +413,7 @@ impl CommandBuffer {
                         device,
                         gpu: Gpu {
                             recorder: None,
+                            native_presentation: false,
                             segments: vec![Segment::default()],
                             blocks: Vec::new(),
                             kept,
@@ -448,6 +454,16 @@ impl CommandBuffer {
 
     fn state(&self) -> MutexGuard<'_, CbState> {
         lock(&self.inner.state)
+    }
+
+    /// Delay scheduling until the final native display write has reached the driver.
+    /// The consumer presents outside Vulkan and captures the driver's submitted fence
+    /// from its scheduled handler or after `wait_until_scheduled` returns.
+    pub fn schedule_native_presentation(&self) -> Result<(), Error> {
+        self.building(|building| {
+            building.gpu.native_presentation = true;
+            Ok(())
+        })
     }
 
     /// Runs `f` on what is being recorded. Err: [`Refusal::Committed`];
@@ -1800,6 +1816,7 @@ pub(crate) fn retire(
         fences,
         executed,
         queries,
+        native_presentation: _,
     } = gpu;
     if let Some(recorder) = recorder {
         core.recorders.give_back(core, recorder);

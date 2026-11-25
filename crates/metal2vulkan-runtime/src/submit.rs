@@ -1714,7 +1714,7 @@ impl WorkState {
             return;
         };
         let empty = pending.gpu.is_empty() && !captured.waits_for(pending.seq);
-        if entry.error.is_some() || empty || pending.gpu.presents() {
+        if entry.error.is_some() || empty || pending.gpu.schedules_after_submit() {
             fifo.send_through = fifo.send_through.max(entry.place);
             return;
         }
@@ -1963,7 +1963,8 @@ impl WorkState {
         else {
             return Step::Staged;
         };
-        if held.is_none() && !pending.gpu.presents() {
+        let native_presentation = pending.gpu.native_presentation;
+        if held.is_none() && !pending.gpu.schedules_after_submit() {
             let scheduled = std::mem::take(&mut pending.handlers.scheduled);
             cb.scheduled(now, !scheduled.is_empty());
             if !scheduled.is_empty() {
@@ -1976,7 +1977,7 @@ impl WorkState {
         // A command buffer held for room behind it joins it or, not taken, sends it first: with
         // room the two would have been staged together.
         let held_behind = (fifo.entries.front()).is_some_and(|entry| entry.held.is_some());
-        match signals || (fifo.goes(stop) && !held_behind) {
+        match signals || native_presentation || (fifo.goes(stop) && !held_behind) {
             true => Step::Goes(index),
             false => Step::Staged,
         }
@@ -2751,7 +2752,7 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
             // retires.
             let now = times::host_time();
             for (cb, pending, error) in &mut finished {
-                if error.is_none() && pending.gpu.presents() {
+                if error.is_none() && pending.gpu.schedules_after_submit() {
                     let scheduled = std::mem::take(&mut pending.handlers.scheduled);
                     cb.scheduled(now, !scheduled.is_empty());
                     if !scheduled.is_empty() {
