@@ -718,4 +718,104 @@ mod on_device {
             }
         });
     }
+
+    /// Programmable blending (`[[color(0)]]`) on a colour render target over imported host memory
+    /// (both `RenderTarget`-only and `RenderTarget | ShaderRead`): succeeds without
+    /// `DrawKind::FetchedAttachment` on every device with attachment reads, writes exact texels to
+    /// the host pages, and runs zero-copy when the device places host-import images in place.
+    #[test]
+    fn every_device_fetches_an_attachment_over_imported_host_memory() {
+        use crate::tests::import::on_device::{free, host_memory, releasing, wait_until};
+        use std::sync::atomic::Ordering;
+
+        let Some(d) = fetching(
+            "exf_fetch_count",
+            "exf_fetch_count",
+            PixelFormat::RGBA32Uint,
+        ) else {
+            return;
+        };
+        each_device("fetch_host_import", |name, _, device| {
+            let Some((_, alignment)) = device.core().imports.host.as_ref() else {
+                println!("fetch-host: {name}: imports no host memory");
+                return;
+            };
+            let alignment = *alignment;
+            let reads = device.core().attachment_reads;
+            let state = state(name, &device, &d);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let clear = ClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            };
+            let row = u64::from(SIDE) * 16;
+            let answer = (device.minimum_linear_texture_alignment(PixelFormat::RGBA32Uint))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let pitch = row.next_multiple_of(answer);
+            let len = (pitch * u64::from(SIDE)).next_multiple_of(alignment);
+            (device.grant_indices(IndexClass::Texture, 4096, 2))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            for (slot, usage) in [
+                TextureUsage::RENDER_TARGET,
+                TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (pointer, mapping) = host_memory(len, alignment);
+                let (release, released) = releasing();
+                // SAFETY: the allocation stays mapped until `released` fires.
+                let (import, _) = unsafe { device.import_host_memory(pointer, len, release) }
+                    .unwrap_or_else(|error| panic!("{name}: import: {error}"));
+                let buffer = (device.new_buffer(import.id, 0, len, None)).expect("a buffer");
+                let mut td = TextureDescriptor::new(
+                    TextureType::Type2D,
+                    PixelFormat::RGBA32Uint,
+                    SIDE,
+                    SIDE,
+                );
+                td.usage = usage;
+                let color = (buffer.new_texture(&td, Some(4096 + slot as u32), 0, pitch))
+                    .unwrap_or_else(|error| panic!("{name}: texture: {error}"));
+                let draws = DRAWS[1];
+                let (drew, counted) =
+                    pass_of((name, &device, &queue), &state, &color, clear, draws);
+                if !reads {
+                    assert_eq!(
+                        format!("{drew:?}"),
+                        format!(
+                            "{:?}",
+                            Err::<(), _>(Error::Unsupported(Gap::Draw {
+                                kind: DrawKind::FetchedAttachment
+                            }))
+                        ),
+                        "{name}: device without attachment reads"
+                    );
+                } else {
+                    drew.unwrap_or_else(|error| panic!("{name}: {draws} draws: {error}"));
+                    let three = 3u32.pow(draws);
+                    let want: Vec<u8> = (0..SIDE * SIDE)
+                        .flat_map(|_| {
+                            [0u32, 0, 0, 1]
+                                .into_iter()
+                                .enumerate()
+                                .map(move |(k, c)| c * three + (k as u32 + 1) * (three - 1) / 2)
+                        })
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    assert_eq!(read(&color, 16), want, "{name}: {usage:?}: every texel");
+                    println!(
+                        "fetch-host: {name} {usage:?}: in_place={} {:?}",
+                        color.copied_over().is_none(),
+                        counted
+                    );
+                }
+                drop((color, buffer, import));
+                wait_until(&device, "the release", || released.load(Ordering::SeqCst));
+                free(mapping);
+            }
+        });
+    }
 }

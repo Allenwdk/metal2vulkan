@@ -294,6 +294,245 @@ fn a_views_swizzle_reads_its_parents_swizzled_channels() {
     );
 }
 
+#[test]
+fn host_memory_in_place_selection_prefers_explicit_modifier_and_falls_back_cleanly() {
+    use crate::counters::OverCause;
+    use crate::texture::{
+        homing_host_dependency, in_place_attachment_reads, in_place_create_error,
+        in_place_pitch_fits, in_place_subresource_aspect, keeps_home_on_copy, linear_image_usage,
+        select_host_laid, select_host_plan, Laid,
+    };
+
+    // Modifier extension available and passes extent+features -> explicit DRM_FORMAT_MOD_LINEAR.
+    assert_eq!(
+        select_host_laid(0, Some((true, true, true)), (false, false, false)),
+        Ok(Laid::HostMemory {
+            memory_type: 0,
+            explicit_modifier: true,
+            feedback: true,
+        })
+    );
+    assert_eq!(
+        select_host_laid(0, Some((true, true, false)), (true, true, true)),
+        Ok(Laid::HostMemory {
+            memory_type: 0,
+            explicit_modifier: true,
+            feedback: false,
+        })
+    );
+    // Modifier unsupported for format/extent, plain LINEAR passes -> plain LINEAR.
+    assert_eq!(
+        select_host_laid(1, Some((false, false, false)), (true, true, true)),
+        Ok(Laid::HostMemory {
+            memory_type: 1,
+            explicit_modifier: false,
+            feedback: true,
+        })
+    );
+    assert_eq!(
+        select_host_laid(1, Some((true, false, false)), (true, true, false)),
+        Ok(Laid::HostMemory {
+            memory_type: 1,
+            explicit_modifier: false,
+            feedback: false,
+        })
+    );
+    // Modifier extension absent, plain LINEAR passes -> plain LINEAR.
+    assert_eq!(
+        select_host_laid(2, None, (true, true, true)),
+        Ok(Laid::HostMemory {
+            memory_type: 2,
+            explicit_modifier: false,
+            feedback: true,
+        })
+    );
+    // Extent passes on at least one tiling, features fail on both -> LinearFeatures.
+    assert_eq!(
+        select_host_laid(0, Some((true, false, false)), (false, false, false)),
+        Err(OverCause::LinearFeatures)
+    );
+    assert_eq!(
+        select_host_laid(0, None, (true, false, false)),
+        Err(OverCause::LinearFeatures)
+    );
+    // Neither tiling accepts HOST_ALLOCATION_EXT -> HostMemory.
+    assert_eq!(
+        select_host_laid(0, Some((false, false, false)), (false, false, false)),
+        Err(OverCause::HostMemory)
+    );
+    assert_eq!(
+        select_host_laid(0, None, (false, false, false)),
+        Err(OverCause::HostMemory)
+    );
+
+    // Linear image usage preserves SAMPLED | ATTACHMENT_FEEDBACK_LOOP_EXT for in-place
+    // framebuffer fetch / self-sampling when feedback is accepted, strips them otherwise,
+    // and keeps upstream COLOR_ATTACHMENT when linear_resolves is set.
+    type U = vk::ImageUsageFlags;
+    let transfer = U::TRANSFER_SRC | U::TRANSFER_DST;
+    let rt_feedback = transfer | U::COLOR_ATTACHMENT | U::SAMPLED | U::ATTACHMENT_FEEDBACK_LOOP_EXT;
+    assert_eq!(
+        linear_image_usage(rt_feedback, false, false, true).as_raw(),
+        rt_feedback.as_raw()
+    );
+    assert_eq!(
+        linear_image_usage(rt_feedback, false, false, false).as_raw(),
+        (transfer | U::COLOR_ATTACHMENT).as_raw()
+    );
+    assert_eq!(
+        linear_image_usage(rt_feedback, true, false, false).as_raw(),
+        (transfer | U::COLOR_ATTACHMENT | U::SAMPLED).as_raw()
+    );
+    // Without ATTACHMENT_FEEDBACK_LOOP_EXT in the plan (shadow-only device), feedback=true must
+    // not keep SAMPLED on a RENDER_TARGET-only image.
+    let rt_shadow_only = transfer | U::COLOR_ATTACHMENT | U::SAMPLED;
+    assert_eq!(
+        linear_image_usage(rt_shadow_only, false, false, true).as_raw(),
+        (transfer | U::COLOR_ATTACHMENT).as_raw()
+    );
+    // ShaderRead-only texture gains COLOR_ATTACHMENT only when linear_resolves is true.
+    let read_only = transfer | U::SAMPLED;
+    assert_eq!(
+        linear_image_usage(read_only, true, false, true).as_raw(),
+        read_only.as_raw()
+    );
+    assert_eq!(
+        linear_image_usage(read_only, true, true, false).as_raw(),
+        (read_only | U::COLOR_ATTACHMENT).as_raw()
+    );
+
+    // In-place attachment reads require either feedback loop or shadow fallback.
+    assert!(in_place_attachment_reads(true, true, false));
+    assert!(in_place_attachment_reads(true, false, true));
+    assert!(!in_place_attachment_reads(true, false, false));
+    assert!(!in_place_attachment_reads(false, true, true));
+
+    // Explicit modifier pitch overflow and driver rejection map to Pitch fallback, not hard Vulkan error.
+    assert!(in_place_pitch_fits(12_224, true));
+    assert!(in_place_pitch_fits(u64::from(u32::MAX), true));
+    assert!(!in_place_pitch_fits(u64::from(u32::MAX) + 64, true));
+    assert!(in_place_pitch_fits(u64::from(u32::MAX) + 64, false));
+
+    assert_eq!(
+        in_place_create_error(
+            vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+            true
+        ),
+        Some(OverCause::Pitch)
+    );
+    assert_eq!(
+        in_place_create_error(
+            vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        in_place_create_error(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, true),
+        None
+    );
+
+    // Subresource layout queries must name MEMORY_PLANE_0_EXT for modifier tiling and COLOR otherwise.
+    assert_eq!(
+        in_place_subresource_aspect(true).as_raw(),
+        vk::ImageAspectFlags::MEMORY_PLANE_0_EXT.as_raw()
+    );
+    assert_eq!(
+        in_place_subresource_aspect(false).as_raw(),
+        vk::ImageAspectFlags::COLOR.as_raw()
+    );
+
+    // Host-import in-place images start UNDEFINED, home with HOST_WRITE, and stay GENERAL on copies.
+    let raw_dep = |(stage, access): (vk::PipelineStageFlags2, vk::AccessFlags2)| {
+        (stage.as_raw(), access.as_raw())
+    };
+    assert_eq!(
+        raw_dep(homing_host_dependency(vk::ImageLayout::UNDEFINED, true)),
+        raw_dep((
+            vk::PipelineStageFlags2::HOST,
+            vk::AccessFlags2::HOST_WRITE,
+        ))
+    );
+    assert_eq!(
+        raw_dep(homing_host_dependency(vk::ImageLayout::UNDEFINED, false)),
+        raw_dep((vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE))
+    );
+    assert_eq!(
+        raw_dep(homing_host_dependency(
+            vk::ImageLayout::PREINITIALIZED,
+            true
+        )),
+        raw_dep((vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE))
+    );
+    assert!(keeps_home_on_copy(vk::ImageLayout::UNDEFINED, true, false));
+    assert!(keeps_home_on_copy(vk::ImageLayout::PREINITIALIZED, false, false));
+    assert!(keeps_home_on_copy(vk::ImageLayout::UNDEFINED, false, true));
+    assert!(!keeps_home_on_copy(vk::ImageLayout::UNDEFINED, false, false));
+
+    // Unextended DRM_FORMAT_MOD_LINEAR wins over extended plain LINEAR so custom pitches bind.
+    assert_eq!(
+        select_host_plan(
+            2,
+            Some((false, false, false)),
+            Some((true, true, true)),
+            (true, true, true),
+            Some((true, true, false)),
+        ),
+        (
+            Ok(Laid::HostMemory {
+                memory_type: 2,
+                explicit_modifier: true,
+                feedback: true,
+            }),
+            true,
+        )
+    );
+    assert_eq!(
+        select_host_plan(
+            2,
+            Some((false, false, false)),
+            Some((false, false, false)),
+            (true, true, false),
+            Some((true, true, true)),
+        ),
+        (
+            Ok(Laid::HostMemory {
+                memory_type: 2,
+                explicit_modifier: false,
+                feedback: false,
+            }),
+            false,
+        )
+    );
+    assert_eq!(
+        select_host_plan(
+            2,
+            Some((false, false, false)),
+            Some((true, false, false)),
+            (false, false, false),
+            Some((true, true, true)),
+        ),
+        (
+            Ok(Laid::HostMemory {
+                memory_type: 2,
+                explicit_modifier: false,
+                feedback: true,
+            }),
+            true,
+        )
+    );
+    assert_eq!(
+        select_host_plan(
+            2,
+            Some((false, false, false)),
+            Some((true, false, false)),
+            (false, false, false),
+            Some((false, false, false)),
+        ),
+        (Err(OverCause::LinearFeatures), false)
+    );
+}
+
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod on_device {
     use super::refused;

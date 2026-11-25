@@ -518,7 +518,7 @@ pub(crate) mod on_device {
                 StorageMode::Shared,
                 "{name}"
             );
-            assert!(texture.copied_over().is_some(), "{name}: copied");
+            let copied = texture.copied_over().is_some();
             let copies = || device.counters().metrics().over_copies;
             let start = device.counters().metrics();
             let before = copies();
@@ -571,7 +571,11 @@ pub(crate) mod on_device {
                 "{name}: the image read the host's bytes"
             );
             let copied_in = copies();
-            assert!(copied_in > before, "{name}: the bytes copied in, counted");
+            if copied {
+                assert!(copied_in > before, "{name}: the bytes copied in, counted");
+            } else {
+                assert_eq!(copied_in, before, "{name}: in-place read copies nothing");
+            }
 
             // Write: a blit from a plain texture reaches the host's memory.
             let mut plain_d = d;
@@ -605,10 +609,18 @@ pub(crate) mod on_device {
                 packed(&host) == source,
                 "{name}: the write reached the host"
             );
-            assert!(
-                copies() > copied_in,
-                "{name}: the image copied back, counted"
-            );
+            if copied {
+                assert!(
+                    copies() > copied_in,
+                    "{name}: the image copied back, counted"
+                );
+            } else {
+                assert_eq!(
+                    copies(),
+                    copied_in,
+                    "{name}: in-place write copies nothing"
+                );
+            }
             let counted = copies() - before;
             // Each copy is over the imported block: counted on the imported side too, each of
             // the texture's texels.
@@ -633,9 +645,10 @@ pub(crate) mod on_device {
             ));
             wait_until(&device, "the release", || released.load(Ordering::SeqCst));
             free(mapping);
+            let form = if copied { "copied" } else { "in place" };
             println!(
                 "import: {name}: a texture over imported host memory (type {memory_type}), \
-                 copied ({counted} copies counted), read and written"
+                 {form} ({counted} copies counted), read and written"
             );
         });
     }

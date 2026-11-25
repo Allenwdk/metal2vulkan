@@ -237,6 +237,9 @@ struct Shadowed {
     rendered: (u32, u32),
     layout: vk::ImageLayout,
     home: vk::ImageLayout,
+    /// The layout copies read `image` in (`Image::copy_layout`: `GENERAL` for in-place buffer
+    /// aliases and exported surface planes, `TRANSFER_SRC_OPTIMAL` elsewhere).
+    copy_source: vk::ImageLayout,
     /// The bytes of a texel.
     texel: u64,
     held: Held,
@@ -1827,6 +1830,9 @@ impl RenderCommandEncoder {
                         rendered: (a.level, a.layer),
                         layout: target.layout,
                         home: a.home,
+                        copy_source: target
+                            .texture
+                            .copy_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
                         texel: target.texture.texel_bytes(),
                         held: Held::default(),
                         cleared: target.clear_color().filter(|_| same),
@@ -1844,10 +1850,7 @@ impl RenderCommandEncoder {
         if planned.iter().all(Vec::is_empty) {
             return Ok(());
         }
-        let (source, destination) = (
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
+        let destination = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
         let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         let (mut away, mut back, mut copies) = (Vec::new(), Vec::new(), Vec::new());
         let mut clears = Vec::new();
@@ -1881,14 +1884,17 @@ impl RenderCommandEncoder {
             };
             let sources = shadow::ranges(&copied);
             let (rendered, rest) = shadow::parted(&sources, s.rendered);
-            if rendered {
+            let source = s.copy_source;
+            if rendered && s.layout != source {
                 let at = range((level, [layer, layer + 1]));
                 away.push(layout_barrier(s.image, at, s.layout, source));
                 back.push(layout_barrier(s.image, at, source, s.layout));
             }
-            for at in rest.into_iter().map(range) {
-                away.push(layout_barrier(s.image, at, s.home, source));
-                back.push(layout_barrier(s.image, at, source, s.home));
+            if s.home != source {
+                for at in rest.into_iter().map(range) {
+                    away.push(layout_barrier(s.image, at, s.home, source));
+                    back.push(layout_barrier(s.image, at, source, s.home));
+                }
             }
             for at in shadow::ranges(areas).into_iter().map(range) {
                 away.push(layout_barrier(s.shadow, at, read_only, destination));
@@ -1904,7 +1910,7 @@ impl RenderCommandEncoder {
             bytes += (copied.iter())
                 .map(|area| area.texels() * s.texel)
                 .sum::<u64>();
-            copies.push((s.image, s.shadow, regions));
+            copies.push((s.image, source, s.shadow, regions));
         }
         self.interrupt(|building, core| {
             let command = building.ordered_command()?;
@@ -1914,9 +1920,9 @@ impl RenderCommandEncoder {
             // it retires (its pass's attachment texture holds it, and it its shadow); each range
             // is in the layout it moves from: the rendered level and layer in the one the pass
             // renders it in, the rest of the image and the shadow at home; each region lies in
-            // both images, in their transfer layouts between the barriers; each cleared range is
-            // a colour level and layer of its shadow, in the transfer destination layout, which
-            // no region of the copies reaches.
+            // both images, in their transfer (or general) layouts between the barriers; each
+            // cleared range is a colour level and layer of its shadow, in the transfer destination
+            // layout, which no region of the copies reaches.
             unsafe {
                 device.cmd_pipeline_barrier2(
                     command,
@@ -1927,8 +1933,8 @@ impl RenderCommandEncoder {
                 for (shadow, color, range) in &clears {
                     device.cmd_clear_color_image(command, *shadow, destination, color, &[*range]);
                 }
-                for (image, shadow, regions) in &copies {
-                    device.cmd_copy_image(command, *image, source, *shadow, destination, regions);
+                for (image, source, shadow, regions) in &copies {
+                    device.cmd_copy_image(command, *image, *source, *shadow, destination, regions);
                 }
                 device.cmd_pipeline_barrier2(
                     command,
