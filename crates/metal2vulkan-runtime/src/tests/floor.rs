@@ -2308,3 +2308,30 @@ fn a_device_that_does_not_calibrate_the_host_clock_is_below_the_floor() {
     );
     assert!(TIME_DOMAINS[1] == crate::HOST_DOMAIN);
 }
+
+#[test]
+fn nonpresenting_keeps_all_rendering_requirements_without_surface_or_swapchain() {
+    use crate::floor::decide_for;
+    use crate::instance::enabled_for;
+    let mut device = at_the_floor();
+    device
+        .extensions
+        .retain(|name| name.as_c_str() != ash::khr::swapchain::NAME);
+    assert!(decide(&device).is_err());
+    let capabilities = decide_for(&device, false).expect("rendering floor is met");
+    assert!(!capabilities.extensions.contains(&ash::khr::swapchain::NAME));
+    let extensions = enabled_for(&[], &[], &[], false, false).unwrap();
+    assert!(
+        !extensions
+            .iter()
+            .any(|name| name.as_c_str() == ash::khr::surface::NAME)
+    );
+    assert!(
+        crate::instance::enabled(&[], &[], &[], false)
+            .unwrap()
+            .iter()
+            .any(|name| name.as_c_str() == ash::khr::surface::NAME)
+    );
+    device.features.vulkan12.buffer_device_address = vk::FALSE;
+    assert!(decide_for(&device, false).is_err());
+}

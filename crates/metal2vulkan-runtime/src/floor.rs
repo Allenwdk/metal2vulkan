@@ -1106,8 +1106,23 @@ pub(crate) unsafe fn check(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
 ) -> Result<Capabilities, BelowFloor> {
+    // SAFETY: the caller provides the same physical device and instance contract.
+    unsafe { check_for(entry, instance, physical, true) }
+}
+
+pub(crate) unsafe fn check_for(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    presentation: bool,
+) -> Result<Capabilities, BelowFloor> {
     // SAFETY: the caller's contract.
-    decide(&unsafe { query(entry, instance, physical) })
+    let queried = unsafe { query(entry, instance, physical) };
+    if presentation {
+        decide(&queried)
+    } else {
+        decide_for(&queried, false)
+    }
 }
 
 /// Reads what [`decide`] needs. A device below Vulkan 1.3 gets its version read alone.
@@ -1295,13 +1310,20 @@ unsafe fn query(
 
 /// Decides from what [`query`] read.
 pub(crate) fn decide(device: &Queried) -> Result<Capabilities, BelowFloor> {
+    decide_for(device, true)
+}
+
+pub(crate) fn decide_for(device: &Queried, presentation: bool) -> Result<Capabilities, BelowFloor> {
     if device.version < VERSION {
         return Err(BelowFloor {
             missing: vec![Missing::Version(device.version)],
         });
     }
     let mut missing = Vec::new();
-    for &extension in DEVICE_EXTENSIONS {
+    for &extension in DEVICE_EXTENSIONS
+        .iter()
+        .filter(|&&extension| presentation || extension != ash::khr::swapchain::NAME)
+    {
         if !device
             .extensions
             .iter()
@@ -1428,6 +1450,7 @@ pub(crate) fn decide(device: &Queried) -> Result<Capabilities, BelowFloor> {
         features,
         extensions: DEVICE_EXTENSIONS
             .iter()
+            .filter(|&&extension| presentation || extension != ash::khr::swapchain::NAME)
             .chain(
                 OPTIONAL_EXTENSIONS
                     .iter()

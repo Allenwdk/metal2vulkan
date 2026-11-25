@@ -30,6 +30,7 @@ pub(crate) struct Shared {
     entry: ash::Entry,
     instance: ash::Instance,
     extensions: Vec<CString>,
+    presentation: bool,
     /// Its devices not yet torn down, which each device's core counts itself among.
     teardowns: Arc<Teardowns>,
 }
@@ -85,6 +86,32 @@ impl Instance {
         extensions: &[&CStr],
         drivers: &[vk::PFN_vkGetInstanceProcAddr],
     ) -> Result<Instance, Error> {
+        // SAFETY: the caller provides the loader and driver contracts below.
+        unsafe { Self::create(loader, extensions, drivers, true) }
+    }
+
+    /// Create an instance for a consumer that presents outside Vulkan, such as a native
+    /// display driver importing completed images. Surface and swapchain extensions are
+    /// neither required nor enabled implicitly. All rendering and memory checks remain.
+    ///
+    /// # Safety
+    /// As for [`Instance::with_drivers`]. The consumer must not issue presentation commands
+    /// through the raw handles unless it explicitly enables every extension they require.
+    pub unsafe fn without_presentation(
+        loader: Option<&Path>,
+        extensions: &[&CStr],
+        drivers: &[vk::PFN_vkGetInstanceProcAddr],
+    ) -> Result<Instance, Error> {
+        // SAFETY: the caller's loader and driver contract is unchanged.
+        unsafe { Self::create(loader, extensions, drivers, false) }
+    }
+
+    unsafe fn create(
+        loader: Option<&Path>,
+        extensions: &[&CStr],
+        drivers: &[vk::PFN_vkGetInstanceProcAddr],
+        presentation: bool,
+    ) -> Result<Instance, Error> {
         // SAFETY: the loader at the caller's path is one, by the caller.
         let entry = unsafe { load(loader) }.map_err(Error::Loader)?;
         // SAFETY: the loader is loaded.
@@ -103,7 +130,11 @@ impl Instance {
                 own.enumerate_instance_extension_properties(None)
             })?);
         }
-        let names = enabled(&loader, &offered, extensions, !drivers.is_empty())?;
+        let names = if presentation {
+            enabled(&loader, &offered, extensions, !drivers.is_empty())
+        } else {
+            enabled_for(&loader, &offered, extensions, !drivers.is_empty(), false)
+        }?;
         let pointers: Vec<*const c_char> = names.iter().map(|name| name.as_ptr()).collect();
         let application = vk::ApplicationInfo::default().api_version(floor::VERSION);
         // Where the loader offers the listing of portability devices, they are listed too.
@@ -137,6 +168,7 @@ impl Instance {
                 entry,
                 instance,
                 extensions: names,
+                presentation,
                 teardowns: Arc::default(),
             }),
         })
@@ -252,7 +284,18 @@ pub(crate) fn enabled(
     extensions: &[&CStr],
     direct: bool,
 ) -> Result<Vec<CString>, Error> {
+    enabled_for(loader, drivers, extensions, direct, true)
+}
+
+pub(crate) fn enabled_for(
+    loader: &[CString],
+    drivers: &[CString],
+    extensions: &[&CStr],
+    direct: bool,
+    presentation: bool,
+) -> Result<Vec<CString>, Error> {
     let mut names: Vec<CString> = (floor::INSTANCE_EXTENSIONS.iter())
+        .filter(|&&name| presentation || name != ash::khr::surface::NAME)
         .map(|&name| name.to_owned())
         .collect();
     let lists =
@@ -308,7 +351,7 @@ impl PhysicalDevice {
     pub fn check(&self) -> Result<floor::Capabilities, floor::BelowFloor> {
         let (entry, instance) = self.instance.raw();
         // SAFETY: the instance listed the device, and was created at the floor's version.
-        unsafe { floor::check(entry, instance, self.raw) }
+        unsafe { floor::check_for(entry, instance, self.raw, self.instance.shared.presentation) }
     }
 
     /// The instance that listed it.
