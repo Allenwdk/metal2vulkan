@@ -185,8 +185,9 @@ pub struct EmitCx<'a> {
     entry_block: Option<SBlockId>,
     /// The block the entry hooks end in, where the walk of the body starts: it dominates every
     /// block of the body, so its memo entries outlive the block that emitted them too. It is the
-    /// entry block but where a hook closed a construct there: a dispatch past its grid
-    /// (`dispatch::emit_entry`) returns from an arm, and the hooks after it, the sink's address
+    /// entry block but where a hook closed a construct there: the floor's tail guard
+    /// (`EmitCx::emit_tail_guard`) or a dispatch past its grid (`dispatch::emit_entry`) returns
+    /// from an arm, and the hooks after it, the sink's address
     /// among them (`access::dynamic::emit_entry`), run in its merge.
     hooks_block: Option<SBlockId>,
     /// While a workgroup synchronization of a predicated walk is emitted, the calling invocation's
@@ -513,46 +514,29 @@ impl<'a> EmitCx<'a> {
     /// load, so a read that canonicalization deletes cannot make the others load it again; a placed
     /// field no instruction reads leaves with the other unused values (`spirv::dead`).
     ///
-    /// The fields read from their push members load first, then the tail folds into them
-    /// ([`EmitCx::fold_tail`]), then the spilled fields and those the function derives, which may
-    /// read through the folded values (the parameter block's address, a slot table's).
+    /// Loads each placed field in placement order, then emits the entry-return floor tail guard
+    /// ([`EmitCx::emit_tail_guard`]) instead of per-field `OpSelect` folding.
     fn load_push_fields(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
         let plan: &Plan = self.plan;
-        let member = |s: &Self, field: PushField| {
-            !s.derives(field) && s.decl.push.iter().any(|m| m.field == field)
-        };
-        for read in [true, false] {
-            for placed in &plan.push.fields {
-                if member(self, placed.field) != read {
-                    continue;
+        for placed in &plan.push.fields {
+            match placed.field {
+                PushField::SlotBounds(slot) => {
+                    self.slot_bounds(fb, slot)?;
                 }
-                match placed.field {
-                    PushField::SlotBounds(slot) => {
-                        self.slot_bounds(fb, slot)?;
-                    }
-                    field => {
-                        self.push_field(fb, field)?;
-                    }
+                field => {
+                    self.push_field(fb, field)?;
                 }
-            }
-            if read {
-                self.fold_tail(fb)?;
             }
         }
-        Ok(())
+        self.emit_tail_guard(fb)
     }
 
     /// Where the plan's placement ends with a tail (`lower::push::tail`): read it from the push
     /// block, test whether it holds the value the consumer never pushes there
-    /// ([`crate::lower::push::tail_never_pushed`]), and make each other field read from its push
-    /// member, as the function's every use recalls it, the member's value where the test fails and
-    /// the null of its type where it holds ([`crate::lower::push::fold_never_pushed`]): the tail's
-    /// read lives while any other push read does, and no branch makes the body depend on it. A
-    /// tail field the function reads from its member is the load [`EmitCx::load_push_fields`] made
-    /// in this block, so the member is loaded once; the tail word, and a field the function
-    /// derives elsewhere, are loaded here. A tail field of the function's own folds into the
-    /// others alone: its own uses need no select to read it.
-    fn fold_tail(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
+    /// ([`crate::lower::push::tail_never_pushed`]), and return from the function where it holds
+    /// ([`crate::lower::push::return_never_pushed`]). The branch is never taken; everything after
+    /// it depends on the tail's read without introducing per-field selects over pushed pointers.
+    fn emit_tail_guard(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
         let Some(field) = crate::lower::push::tail(&self.plan.push) else {
             return Ok(());
         };
@@ -564,35 +548,10 @@ impl<'a> EmitCx<'a> {
             true => self.push_field(fb, field)?,
             false => Self::load_member(fb, push, member.index)?,
         };
-        let Some(never) = crate::lower::push::tail_never_pushed(fb, value, field)? else {
-            return Ok(());
-        };
-        let plan: &Plan = self.plan;
-        for placed in &plan.push.fields {
-            let other = placed.field;
-            if other == field
-                || self.derives(other)
-                || !self.decl.push.iter().any(|m| m.field == other)
-            {
-                continue;
-            }
-            let keys = match other {
-                PushField::SlotBounds(slot) => vec![
-                    Invariant::Push(other),
-                    Invariant::Bounds(slot, false),
-                    Invariant::Bounds(slot, true),
-                ],
-                _ => vec![Invariant::Push(other)],
-            };
-            for key in keys {
-                let Some(v) = self.recall(fb, key) else {
-                    return Err(self.fail("a pushed field not loaded before the tail folds"));
-                };
-                let folded = crate::lower::push::fold_never_pushed(fb, never, v)?;
-                self.remember(fb, key, folded);
-            }
+        match crate::lower::push::tail_never_pushed(fb, value, field)? {
+            Some(never) => crate::lower::push::return_never_pushed(fb, never),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Checked slot `slot`'s bounds (`PushField::SlotBounds`), split: its buffer's bytes before
@@ -1623,7 +1582,7 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
             let r = em
                 .cx
                 .begin_hooks(&fb)
-                // The push fields, the floor's tail folded into them (`EmitCx::fold_tail`).
+                // The push fields and the floor's entry-return tail guard (`EmitCx::emit_tail_guard`).
                 .and_then(|()| em.cx.load_push_fields(&mut fb))
                 .and_then(|()| dispatch::emit_entry(&mut em.cx, &mut fb))
                 // What the invocation draws (a merged draw's command and its slot tables) before

@@ -474,10 +474,27 @@ pub(crate) fn tail_never_pushed(
     Ok(Some(set))
 }
 
+/// A stage's tail test `never` ([`tail_never_pushed`]): return from the function where it holds.
+/// The branch is never taken; the return keeps the read from any optimizer, as everything the
+/// function does after it depends on it.
+pub(crate) fn return_never_pushed(
+    fb: &mut crate::spirv::builder::FunctionBuilder<'_>,
+    never: crate::spirv::ids::Value,
+) -> crate::spirv::error::BResult<()> {
+    use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
+    let leave: ArmFn<'_, ()> = Box::new(|fb, _| {
+        fb.ret(None)?;
+        Ok(ArmEnd::Exits)
+    });
+    fb.if_(&mut (), never, leave, None)?;
+    Ok(())
+}
+
 /// `value`, a pushed field's value as its member was read, where the stage's tail does not hold
 /// the value the consumer never pushes there (`never`, [`tail_never_pushed`]), else the null of
 /// its type: the value the consumer's push gives, through a select whose condition is the tail's
 /// test, so the field's every use reads the tail too.
+#[allow(dead_code)]
 pub(crate) fn fold_never_pushed(
     fb: &mut crate::spirv::builder::FunctionBuilder<'_>,
     never: crate::spirv::ids::Value,
